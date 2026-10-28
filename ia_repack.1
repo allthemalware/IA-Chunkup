@@ -1,16 +1,29 @@
 .\" Manpage for ia_repack.
 .TH IA_REPACK 1 "2026-10-28" "ia_repack 1.0" "User Commands"
 .SH NAME
-ia_repack \- replace named archive.org folders with uncompressed tar files
+ia_repack \- replace archive.org folders with uncompressed tar files
 .SH SYNOPSIS
 .B ia_repack.py
-.I IDENTIFIER FOLDER
+.I IDENTIFIER
 .RI [ FOLDER ...]
 .RI [ OPTIONS ]
 .SH DESCRIPTION
-Processes explicit folder paths sequentially in their given order. Each folder
-is an exact item-relative filename prefix. The workflow downloads and verifies
-all selected files, creates an uncompressed tar, reads back every member to
+Processes folders sequentially. Explicit folder paths are processed in their
+given order. --auto discovers every top-level folder; nested folders are packed
+inside their top-level folder and root-level files are left alone. Each folder
+is an exact item-relative filename prefix. With neither paths nor --auto, an
+interactive prompt offers named folders or automatic discovery. Named paths
+are entered one per line, with a blank line to finish. Unattended runs must
+provide paths or --auto, even with --yes.
+.PP
+Automatic discovery lists folders in alphabetical order on the first run and
+saves them in WORKDIR/auto.json. Later runs retain the saved order and append
+newly discovered folders. The plan lets interrupted verification or cleanup
+resume even after a folder's remote sources disappear. If there are no folders
+to discover or resume, no workspace is created.
+.PP
+The workflow downloads and verifies all selected files, creates an
+uncompressed tar, reads back every member to
 verify its size and MD5, uploads the tar into the same item, and confirms its
 size and MD5 in IA metadata before deleting any remote source files.
 .PP
@@ -25,6 +38,10 @@ command. The journal allows partially completed deletions to resume without
 downloading again. Failure stops processing before the next folder.
 .SH OPTIONS
 .TP
+.B --auto
+Discover all top-level folders and process them one at a time. Cannot be
+combined with explicit folder paths. Does not imply --delete-originals.
+.TP
 .B --dry-run
 Plan only. Write nothing locally or remotely; credentials are unnecessary.
 .TP
@@ -33,7 +50,8 @@ Delete remote source files after confirming the uploaded tar. Without this,
 remote sources are retained.
 .TP
 .B --yes, -y
-Confirm remote source deletion for unattended operation.
+Confirm remote source deletion for unattended operation. Does not select a
+folder mode or skip the selection prompt when neither paths nor --auto is given.
 .TP
 .B --clean-local
 Remove generated downloads and local tar after successful remote operations,
@@ -75,6 +93,9 @@ re-run later if confirmation retries run out.
 unsafe/changed source paths; 130 interrupted.
 .SH EXAMPLES
 .nf
+ia_repack.py my-item
+ia_repack.py my-item --auto --delete-originals --dry-run
+ia_repack.py my-item --auto --delete-originals --yes --clean-local
 ia_repack.py my-item 'folder one' 'parent/folder two' --dry-run
 ia_repack.py my-item 'folder one' 'parent/folder two' \\
     --delete-originals --yes --clean-local --log repack.log

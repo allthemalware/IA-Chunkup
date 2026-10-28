@@ -106,13 +106,44 @@ lock or log files, even if `--log` is supplied.
 Download exit codes are 0 for completion, 1 for transfer/local I/O failures,
 2 for invalid options/paths or a refused overwrite, and 130 for interruption.
 
-## Replace named folders with uncompressed tars
+## Replace folders with uncompressed tars
 
-`ia_repack.py` processes only the folder paths you name, in their given order.
-IA folders are filename prefixes: `maps/quake` selects `maps/quake/...`, and
-does not select `maps/quake2/...`.
+`ia_repack.py` processes folders one at a time. Run it with only the item
+identifier to choose how folders are selected:
 
-Preview the complete workflow:
+```sh
+./ia_repack.py Game-maps-collection --delete-originals
+```
+
+The prompt offers **named folders** (enter one path per line, then a blank
+line) or **automatic discovery** of every top-level folder. Paths containing
+spaces can be entered directly at the prompt. IA folders are filename
+prefixes: `maps/quake` selects `maps/quake/...`, and does not select
+`maps/quake2/...`.
+
+Use `--auto` to select automatic discovery directly:
+
+```sh
+./ia_repack.py Game-maps-collection --auto --delete-originals --dry-run
+./ia_repack.py Game-maps-collection --auto --delete-originals --yes \
+    --clean-local --log repack.log
+```
+
+Automatic mode lists the discovered folders, processes them in alphabetical
+order on the first run, and leaves root-level files (including existing tar
+files) alone. Nested folders are included in their top-level folder's tar.
+The selected folders are saved in `WORKDIR/auto.json` so that interrupted
+verification or cleanup can resume even after their remote sources disappear.
+Later runs retain the saved order and append newly discovered folders. With
+no folders to discover or resume, the command exits successfully without
+creating a workspace.
+
+Providing folder paths on the command line selects named mode directly and
+preserves their given order. `--auto` and named folder arguments cannot be
+combined. Unattended runs must supply one of these explicit selections;
+`--yes` confirms deletion and does not choose a folder mode.
+
+Preview the workflow for named folders:
 
 ```sh
 ./ia_repack.py Game-maps-collection 'folder one' 'parent/folder two' \
@@ -137,7 +168,7 @@ For each folder, it:
 5. With `--delete-originals`, deletes only the frozen list of verified source
    files. It checks the remote tar and source snapshot before each deletion,
    disables cascade deletion, and waits for metadata to confirm removal.
-6. Moves to the next named folder.
+6. Moves to the next selected folder.
 
 Without `--delete-originals`, it uploads the tars and retains the remote
 sources. `--yes` confirms source deletion for unattended runs. An existing

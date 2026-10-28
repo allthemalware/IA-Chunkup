@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 Whyte
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Replace named IA folders with verified, uncompressed tar files, one at a time.
+"""Replace IA folders with verified, uncompressed tar files, one at a time.
 
+  ./ia_repack.py ITEM                         # choose named or automatic mode
+  ./ia_repack.py ITEM --auto --dry-run
   ./ia_repack.py ITEM 'folder one' 'parent/folder two' --dry-run
   ./ia_repack.py ITEM 'folder one' --delete-originals --yes --clean-local
 
@@ -34,6 +36,84 @@ from internetarchive.iarequest import S3Request
 
 
 log = download.log
+
+
+def validate_folders(folders):
+    folders = [folder.rstrip("/") for folder in folders]
+    for folder in folders:
+        download.select_files({"files": [{"name": folder + "/check", "size": "0"}]},
+                             argparse.Namespace(original=False, glob=[], exclude=[]))
+    for index, folder in enumerate(folders):
+        for other in folders[index + 1:]:
+            aa, bb = folder.casefold(), other.casefold()
+            if aa == bb or aa.startswith(bb + "/") or bb.startswith(aa + "/") or (
+                    aa.startswith(bb + ".tar/") or bb.startswith(aa + ".tar/")):
+                raise download.UsageError("Selected folders overlap or collide with an output tar")
+    return folders
+
+
+def prompt_folder_mode(args):
+    """Explicit arguments select a mode; otherwise ask without defaulting to all."""
+    if args.auto and args.folders:
+        raise download.UsageError("Use either --auto or named folder paths, not both")
+    if args.auto or args.folders:
+        return
+    if not sys.stdin.isatty():
+        raise download.UsageError("Provide folder paths or --auto; interactive selection needs a terminal")
+    print("Choose which folders to repack:")
+    print("  1. Enter folder paths")
+    print("  2. Automatically discover all top-level folders")
+    try:
+        while True:
+            choice = input("Folder selection [1/2]: ").strip().lower()
+            if choice in ("2", "auto", "automatic"):
+                args.auto = True
+                return
+            if choice in ("1", "named", "manual"):
+                print("Enter one folder path per line; enter a blank line when finished.")
+                while True:
+                    folder = input("Folder path: ").strip()
+                    if not folder:
+                        if args.folders:
+                            return
+                        print("Enter at least one folder path.")
+                    else:
+                        args.folders.append(folder)
+            print("Choose 1 for named folders or 2 for automatic discovery.")
+    except EOFError as exc:
+        raise download.UsageError("Folder selection cancelled: input ended; provide paths or --auto") from exc
+
+
+def discover_folders(metadata):
+    """Discover each top-level prefix once; files at the item root are excluded."""
+    entries = metadata.get("files")
+    if not isinstance(entries, list):
+        raise download.UsageError("Item does not exist or has no accessible file list")
+    folders = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            raise download.UsageError("Malformed file entry in item metadata")
+        if "/" in entry["name"]:
+            folders.add(entry["name"].split("/", 1)[0])
+    return validate_folders(sorted(folders, key=lambda folder: (folder.casefold(), folder)))
+
+
+def auto_folders(path, identifier, discovered):
+    """Retain prior selections for resume and append newly discovered folders."""
+    download.check_path(path)
+    folders = []
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(data, dict) or data.get("version") != 1
+                    or data.get("identifier") != identifier
+                    or not isinstance(data.get("folders"), list)
+                    or any(not isinstance(folder, str) for folder in data["folders"])):
+                raise ValueError("wrong item, version or folder list")
+            folders = validate_folders(data["folders"])
+        except (ValueError, UnicodeError) as exc:
+            raise download.UsageError(f"Unusable automatic folder plan {path}: {safe(exc)}") from exc
+    return validate_folders(folders + [folder for folder in discovered if folder not in folders])
 
 
 def write_job(path, data):
@@ -308,7 +388,8 @@ def process_folder(session, args, interrupt, folder, work):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("identifier")
-    parser.add_argument("folders", nargs="+", help="Exact remote folder paths, processed in this order")
+    parser.add_argument("folders", nargs="*", help="Exact remote folder paths; omit to choose a mode interactively")
+    parser.add_argument("--auto", action="store_true", help="Discover all top-level folders and process them sequentially")
     parser.add_argument("--workdir", type=Path, help="Persistent work directory (default: .ia_repack_ID)")
     parser.add_argument("--dry-run", action="store_true", help="Plan only; write and change nothing")
     parser.add_argument("--delete-originals", action="store_true", help="Delete source files after verifying the tar on IA")
@@ -335,21 +416,22 @@ def run(args, interrupt):
             raise download.UsageError(f"Invalid --{name.replace('_', '-')}")
     if args.retries < 1:
         raise download.UsageError("--retries must be at least 1")
-    args.folders = [folder.rstrip("/") for folder in args.folders]
-    for folder in args.folders:
-        download.select_files({"files": [{"name": folder + "/check", "size": "0"}]},
-                             argparse.Namespace(original=False, glob=[], exclude=[]))
-    for index, folder in enumerate(args.folders):
-        for other in args.folders[index + 1:]:
-            aa, bb = folder.casefold(), other.casefold()
-            if aa == bb or aa.startswith(bb + "/") or bb.startswith(aa + "/") or (
-                    aa.startswith(bb + ".tar/") or bb.startswith(aa + ".tar/")):
-                raise download.UsageError("Named folders overlap or collide with an output tar")
+    prompt_folder_mode(args)
+    args.folders = validate_folders(args.folders)
     work = download.absolute(args.workdir or Path(f".ia_repack_{args.identifier}"))
     download.check_path(work, directory=True)
     if args.log and download.overlapping(download.absolute(args.log), work):
         raise download.UsageError("--log must be outside the work directory")
     with download.archive_session() as session:
+        plan = work / "auto.json"
+        if args.auto:
+            metadata = download.read_manifest(session, args, interrupt)
+            discovered = discover_folders(metadata)
+            args.folders = auto_folders(plan, args.identifier, discovered)
+            log.info("Automatic folder selection: %s", ", ".join(repr(f) for f in args.folders) or "none")
+            if not args.folders:
+                log.info("No top-level folders to repack; root-level files are left alone.")
+                return 0
         if not args.dry_run:
             if not session.access_key or not session.secret_key:
                 raise download.UsageError("IA write credentials required; run ia configure first")
@@ -357,7 +439,11 @@ def run(args, interrupt):
                 if not sys.stdin.isatty():
                     raise download.UsageError("Use --yes with --delete-originals for unattended operation")
                 print("Folders to replace on IA: " + ", ".join(repr(f) for f in args.folders))
-                if input("Delete their source files after verifying each uploaded tar? [y/N] ").strip().lower() not in ("y", "yes"):
+                try:
+                    answer = input("Delete their source files after verifying each uploaded tar? [y/N] ")
+                except EOFError as exc:
+                    raise download.UsageError("Deletion declined: input ended") from exc
+                if answer.strip().lower() not in ("y", "yes"):
                     raise download.UsageError("Deletion declined")
             work.mkdir(parents=True, exist_ok=True)
             if args.log:
@@ -367,6 +453,10 @@ def run(args, interrupt):
                 process_folder(session, args, interrupt, folder, work)
         else:
             with download.RunLock(work / "run.lock"):
+                if args.auto:
+                    if auto_folders(plan, args.identifier, discovered) != args.folders:
+                        raise download.UsageError("Automatic folder plan changed during startup; re-run to review it")
+                    write_job(plan, {"version": 1, "identifier": args.identifier, "folders": args.folders})
                 for folder in args.folders:
                     interrupt.check()
                     process_folder(session, args, interrupt, folder, work)

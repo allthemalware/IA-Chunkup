@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 from pathlib import Path
 import tarfile
 import tempfile
@@ -68,7 +69,7 @@ class RepackTests(unittest.TestCase):
 
     def run_repack(self, *options, folders=None):
         with contextlib.redirect_stdout(self.output):
-            return repack.main(["test-item", *(folders or ["folder one", "folder two"]),
+            return repack.main(["test-item", *(["folder one", "folder two"] if folders is None else folders),
                 "--workdir", str(self.work), "--retry-wait", "0", "--max-retry-wait", "0",
                 "--retries", "2", *options])
 
@@ -229,6 +230,147 @@ class RepackTests(unittest.TestCase):
         with patch.object(session, "send", side_effect=responses) as send:
             REAL_DELETE_ONE(session, args, download.Interrupt(), "folder/file")
         self.assertEqual(send.call_count, 2)
+
+    def test_auto_replaces_top_level_folders_sequentially_and_ignores_root_files(self):
+        self.remote.pop("unselected/keep")
+        self.remote["keep.txt"] = b"root file"
+        with patch("builtins.input", side_effect=AssertionError("Explicit mode should not prompt")):
+            self.assertEqual(self.run_repack("--auto", "--delete-originals", "--yes",
+                                             "--clean-local", folders=[]), 0)
+        self.assertEqual(set(self.remote), {"folder one.tar", "folder two.tar", "keep.txt"})
+        self.assertLess(self.events.index(("delete", "folder one/sub/empty")),
+                        self.events.index(("download", "folder two/b.bin")))
+        plan = json.loads((self.work / "auto.json").read_text())
+        self.assertEqual(plan["folders"], ["folder one", "folder two"])
+        self.assertEqual(list(self.work.rglob("archive.tar")), [])
+        self.assertEqual(self.run_repack("--auto", "--delete-originals", "--yes",
+                                         "--clean-local", folders=[]), 0)
+        self.assertEqual(self.upload_mock.call_count, 2)
+
+    def test_auto_resumes_confirmation_and_cleanup_after_sources_disappear(self):
+        self.remote.pop("unselected/keep")
+        real_poll = repack.poll_archive
+        failed = False
+
+        def fail_confirmation(*args, **kwargs):
+            nonlocal failed
+            if kwargs.get("removed") and not failed:
+                failed = True
+                raise download.TransferError("confirmation timed out", retryable=False)
+            return real_poll(*args, **kwargs)
+
+        with patch.object(repack, "poll_archive", side_effect=fail_confirmation):
+            self.assertEqual(self.run_repack("--auto", "--delete-originals", "--yes",
+                                             "--clean-local", folders=[]), 1)
+        self.assertFalse(any(name.startswith("folder one/") for name in self.remote))
+        self.assertEqual(len(list(self.work.rglob("archive.tar"))), 1)
+        self.assertEqual(self.run_repack("--auto", "--delete-originals", "--yes",
+                                         "--clean-local", folders=[]), 0)
+        self.assertEqual(self.download_mock.call_count, 3)
+        self.assertEqual(self.upload_mock.call_count, 2)
+        self.assertEqual(list(self.work.rglob("archive.tar")), [])
+
+    def test_auto_dry_run_lists_sorted_top_level_folders_without_writing(self):
+        self.session.access_key = None
+        with patch.object(repack, "process_folder") as process:
+            self.assertEqual(self.run_repack("--auto", "--dry-run", folders=[]), 0)
+        self.assertEqual([call.args[3] for call in process.call_args_list],
+                         ["folder one", "folder two", "unselected"])
+        self.assertFalse(self.work.exists())
+        self.assertEqual(self.events, [])
+
+    def test_auto_with_only_root_files_is_a_noop(self):
+        self.remote = {"root.txt": b"root", "existing.tar": b"already packed"}
+        self.session.access_key = None
+        self.assertEqual(self.run_repack("--auto", "--delete-originals", "--yes", folders=[]), 0)
+        self.assertIn("No top-level folders", self.output.getvalue())
+        self.assertFalse(self.work.exists())
+        self.assertEqual(self.events, [])
+
+    def test_auto_appends_new_folders_to_saved_selection(self):
+        self.work.mkdir()
+        repack.write_job(self.work / "auto.json", {
+            "version": 1, "identifier": "test-item", "folders": ["unselected"]})
+        with patch.object(repack, "process_folder") as process:
+            self.assertEqual(self.run_repack("--auto", folders=[]), 0)
+        self.assertEqual([call.args[3] for call in process.call_args_list],
+                         ["unselected", "folder one", "folder two"])
+        self.assertEqual(json.loads((self.work / "auto.json").read_text())["folders"],
+                         ["unselected", "folder one", "folder two"])
+
+    def test_auto_refuses_invalid_metadata_paths_and_colliding_folders(self):
+        initial = dict(self.remote)
+        for name in ("../escape", "/absolute", "Folder one/case", "folder one.tar/nested"):
+            with self.subTest(name=name):
+                self.remote = {**initial, name: b"unsafe"}
+                self.assertEqual(self.run_repack("--auto", "--dry-run", folders=[]), 2)
+                self.assertFalse(self.work.exists())
+        self.assertEqual(self.events, [])
+
+    def test_auto_refuses_unusable_or_wrong_item_saved_plans(self):
+        self.work.mkdir()
+        plan = self.work / "auto.json"
+        for contents in ("invalid JSON", json.dumps({"version": 1, "identifier": "different-item",
+                        "folders": ["folder one"]}), json.dumps({"version": 1,
+                        "identifier": "test-item", "folders": ["../escape"]})):
+            with self.subTest(contents=contents):
+                plan.write_text(contents)
+                self.assertEqual(self.run_repack("--auto", "--dry-run", folders=[]), 2)
+                self.assertEqual(plan.read_text(), contents)
+        self.assertEqual(self.events, [])
+
+    def test_prompt_selects_automatic_mode(self):
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["2"]) as ask:
+            self.assertEqual(self.run_repack("--dry-run", folders=[]), 0)
+        ask.assert_called_once_with("Folder selection [1/2]: ")
+        self.assertIn("Automatically discover all top-level folders", self.output.getvalue())
+        self.assertIn("Automatic folder selection", self.output.getvalue())
+        self.assertFalse(self.work.exists())
+
+    def test_prompt_selects_named_paths_with_spaces_and_preserves_order(self):
+        answers = ["1", "folder two", "folder one", ""]
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=answers):
+            with patch.object(repack, "process_folder") as process:
+                self.assertEqual(self.run_repack("--dry-run", folders=[]), 0)
+        self.assertEqual([call.args[3] for call in process.call_args_list], ["folder two", "folder one"])
+        self.assertNotIn("Automatic folder selection", self.output.getvalue())
+
+    def test_prompt_retries_invalid_choices_and_empty_named_selection(self):
+        answers = ["invalid", "1", "", "folder one", ""]
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=answers):
+            self.assertEqual(self.run_repack("--dry-run", folders=[]), 0)
+        self.assertIn("Choose 1 for named folders or 2", self.output.getvalue())
+        self.assertIn("Enter at least one folder path", self.output.getvalue())
+
+    def test_prompt_eof_cancels_without_side_effects(self):
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=EOFError):
+            self.assertEqual(self.run_repack(folders=[]), 2)
+        self.assertFalse(self.work.exists())
+        self.assertEqual(self.events, [])
+        self.manifest_mock.assert_not_called()
+
+    def test_prompt_interrupt_cancels_without_side_effects(self):
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=KeyboardInterrupt):
+            self.assertEqual(self.run_repack(folders=[]), 130)
+        self.assertFalse(self.work.exists())
+        self.assertEqual(self.events, [])
+
+    def test_unattended_mode_requires_explicit_selection_even_with_yes(self):
+        with patch("sys.stdin.isatty", return_value=False):
+            self.assertEqual(self.run_repack("--yes", folders=[]), 2)
+        self.manifest_mock.assert_not_called()
+        self.assertFalse(self.work.exists())
+
+    def test_auto_cannot_be_combined_with_named_paths(self):
+        self.assertEqual(self.run_repack("--auto", "--dry-run"), 2)
+        self.manifest_mock.assert_not_called()
+        self.assertFalse(self.work.exists())
+
+    def test_selecting_auto_does_not_confirm_deletion(self):
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["2", "n"]):
+            self.assertEqual(self.run_repack("--delete-originals", folders=[]), 2)
+        self.assertEqual(self.events, [])
+        self.assertFalse(self.work.exists())
 
 
 if __name__ == "__main__":
