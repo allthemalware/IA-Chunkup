@@ -37,12 +37,10 @@ from __future__ import annotations
 import argparse
 import atexit
 import fnmatch
-import hashlib
 import json
 import logging
 import os
 import random
-import re
 import signal
 import sys
 import threading
@@ -56,6 +54,7 @@ try:
     import requests
     from internetarchive import get_item, get_session
     from internetarchive.utils import validate_s3_identifier
+    from ia_common import NETWORK_ERRORS, RETRYABLE_STATUS, clock, human, md5_of, safe
 except ImportError as exc:
     sys.exit(
         f"Missing dependency ({exc.name}). Install with:\n"
@@ -66,17 +65,6 @@ except ImportError as exc:
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
-
-# Transient network failures. Retry these.
-NETWORK_ERRORS = (
-    requests.exceptions.Timeout,
-    requests.exceptions.ConnectionError,      # includes SSLError, ProxyError
-    requests.exceptions.ChunkedEncodingError,
-)
-
-# 503 is IA's "node busy / out of space" signal and is the most common
-# failure on large batches. 429 is rate limiting.
-RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504, 507}
 
 # No amount of retrying fixes these.
 FATAL_STATUS = {400, 401, 403, 404, 409}
@@ -103,15 +91,7 @@ MAX_REMOTE_NAME_BYTES = 240          # IA rejects very long keys
 HEARTBEAT_SECONDS = 60
 RATE_WINDOW_SECONDS = 600            # ETA looks at recent throughput, not the run's whole history
 
-# Redact anything shaped like IA's S3 auth header before logging.
-_SECRET_RE = re.compile(r"(LOW\s+)[A-Za-z0-9]+:[A-Za-z0-9]+", re.IGNORECASE)
-
 log = logging.getLogger("ia_upload")
-
-
-def safe(text: object) -> str:
-    """Strip credentials out of anything before it reaches a log or console."""
-    return _SECRET_RE.sub(r"\1<redacted>", str(text))
 
 
 class Outcome(Enum):
@@ -309,26 +289,6 @@ def check_names(files: list[LocalFile], identifier: str) -> list[str]:
             problems.append(f"{f.path}: collides with {seen[lowered]} (case-insensitive)")
         seen[lowered] = name
     return problems
-
-
-def _md5() -> "hashlib._Hash":
-    """MD5 here is IA's content checksum, not a security primitive.
-
-    On a FIPS-enforcing build a bare hashlib.md5() raises, which would take
-    the whole run down; usedforsecurity=False is the documented opt-out.
-    """
-    try:
-        return hashlib.md5(usedforsecurity=False)
-    except TypeError:          # Python < 3.9
-        return hashlib.md5()
-
-
-def md5_of(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
-    h = _md5()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(chunk_size), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 # --------------------------------------------------------------------------
@@ -664,14 +624,6 @@ def upload_one(
 # Formatting helpers
 # --------------------------------------------------------------------------
 
-def human(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(n) < 1024:
-            return f"{int(n)}B" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}PB"
-
-
 def rolling_rate(window: deque[tuple[float, float, int]], now: float, size: int, elapsed: float) -> float:
     """Record a completed file and return bytes/sec over a recent window.
 
@@ -691,15 +643,6 @@ def rolling_rate(window: deque[tuple[float, float, int]], now: float, size: int,
     # inflating the rate.
     window_span = max(now - (window[0][0] - window[0][1]), elapsed, 0.001)
     return window_bytes / window_span
-
-
-def clock(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m{seconds % 60:02d}s"
-    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
 # --------------------------------------------------------------------------

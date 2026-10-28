@@ -1,0 +1,83 @@
+.\" Manpage for ia_download.
+.TH IA_DOWNLOAD 1 "2026-10-28" "ia_download 1.0" "User Commands"
+.SH NAME
+ia_download \- resilient, resumable downloads from archive.org items
+.SH SYNOPSIS
+.B ia_download.py
+.I IDENTIFIER DESTINATION
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+Downloads files into DESTINATION, preserving item-relative paths. Partial
+files are kept separately until their size and MD5 match the item's metadata,
+then renamed into place atomically. Re-run the identical command to resume.
+Public downloads need no credentials; configured IA cookies/keys are used
+when available.
+.PP
+Resumed requests validate Content-Range before appending. A server that ignores
+Range causes a safe restart. Unsafe paths, symlinks and case-insensitive name
+collisions are refused. Existing files with different contents require
+confirmation or --yes.
+.SH OPTIONS
+.TP
+.B --dry-run
+Read metadata and compare local files. Write no files, including logs.
+.TP
+.B --original
+Select only files whose metadata source is original.
+.TP
+.BI --glob " PATTERN"
+Include matching remote paths; repeatable. Matching is case-sensitive and *
+also matches slash. With no globs, all files are selected.
+.TP
+.BI --exclude " PATTERN"
+Exclude matching remote paths; repeatable, usable without --glob.
+.TP
+.BI --retries " N"
+Attempts per request (default 12), including the first attempt.
+.TP
+.BI --retry-wait " SEC"
+Initial exponential backoff (default 15).
+.TP
+.BI --max-retry-wait " SEC"
+Backoff ceiling before jitter (default 600). Retry-After can extend the delay.
+.TP
+.BI --wait-between " SEC"
+Pause between files (default 0).
+.TP
+.BI --connect-timeout " SEC"
+Connection timeout (default 30).
+.TP
+.BI --read-timeout " SEC"
+Read inactivity timeout (default 60), independent of total file size.
+.TP
+.BI --state " PATH"
+Override DESTINATION/.ia_download/state/IDENTIFIER.json. The destination lock
+still applies, regardless of the state path.
+.TP
+.BI --log " PATH"
+Append redacted logs to PATH. Ignored in dry runs.
+.TP
+.B --yes, -y
+Replace differing local files without prompting.
+.SH VERIFICATION
+Missing metadata sizes/checksums reduce verification to the available fields
+and are reported. Files without MD5 restart partial transfers from zero.
+Files without either size or MD5 are reused only if unchanged since a download
+recorded in the state. Cached verification is invalidated by local changes.
+.SH FILES
+.TP
+.I DESTINATION/.ia_download/
+Resume state, exclusive locks and partial files. Deleting the state causes
+re-hashing and restarts partial files, but does not affect completed downloads.
+.SH EXIT STATUS
+0 complete or no matching files; 1 transfer/local I/O failure; 2 invalid
+arguments, unsafe paths or refused overwrite; 130 interrupted.
+.SH EXAMPLES
+.nf
+ia_download.py my-item ./files/ --dry-run
+ia_download.py my-item ./files/ --glob '*.zip' --log download.log
+.fi
+.SH SEE ALSO
+.BR ia_repack (1), ia_upload (1)
+.SH COPYRIGHT
+Copyright (C) 2026 Whyte. GPL-3.0-or-later. See LICENSE.

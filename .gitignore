@@ -3,6 +3,10 @@
 .ia_upload_*.json.tmp
 .ia_upload_*.json.lock
 
+# Folder repacking workspaces (downloads, tar files and resume journals)
+.ia_repack_*/
+.ia_download/
+
 # Logs
 *.log
 

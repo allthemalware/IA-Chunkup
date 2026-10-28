@@ -1,0 +1,85 @@
+.\" Manpage for ia_repack.
+.TH IA_REPACK 1 "2026-10-28" "ia_repack 1.0" "User Commands"
+.SH NAME
+ia_repack \- replace named archive.org folders with uncompressed tar files
+.SH SYNOPSIS
+.B ia_repack.py
+.I IDENTIFIER FOLDER
+.RI [ FOLDER ...]
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+Processes explicit folder paths sequentially in their given order. Each folder
+is an exact item-relative filename prefix. The workflow downloads and verifies
+all selected files, creates an uncompressed tar, reads back every member to
+verify its size and MD5, uploads the tar into the same item, and confirms its
+size and MD5 in IA metadata before deleting any remote source files.
+.PP
+parent/folder becomes parent/folder.tar. Members retain full item-relative
+paths. Originals are deleted only with --delete-originals. Deletion is limited
+to the frozen source list, with cascade deletion disabled. The tar and source
+snapshot are rechecked before each delete. New or changed sources stop the
+workflow. A different existing remote tar is never overwritten.
+.PP
+Keep the work directory after interruption or failure and re-run the same
+command. The journal allows partially completed deletions to resume without
+downloading again. Failure stops processing before the next folder.
+.SH OPTIONS
+.TP
+.B --dry-run
+Plan only. Write nothing locally or remotely; credentials are unnecessary.
+.TP
+.B --delete-originals
+Delete remote source files after confirming the uploaded tar. Without this,
+remote sources are retained.
+.TP
+.B --yes, -y
+Confirm remote source deletion for unattended operation.
+.TP
+.B --clean-local
+Remove generated downloads and local tar after successful remote operations,
+before moving to the next folder. Journals remain. Without this option, local
+files are retained.
+.TP
+.BI --workdir " PATH"
+Persistent workspace (default .ia_repack_IDENTIFIER). Allow about twice the
+current folder's size during packing, plus any retained earlier folders.
+.TP
+.BI --log " PATH"
+Append redacted logs outside the workspace. Ignored in dry runs.
+.TP
+.BI --retries " N"
+Attempts per request or verification poll (default 12).
+.TP
+.BI --retry-wait " SEC"
+Initial exponential backoff (default 15).
+.TP
+.BI --max-retry-wait " SEC"
+Backoff ceiling before jitter (default 600).
+.TP
+.BI --wait-between " SEC"
+Pause between folders (default 0).
+.TP
+.BI --connect-timeout " SEC"
+Connection timeout (default 30).
+.TP
+.BI --read-timeout " SEC"
+Download/metadata/delete read inactivity timeout (default 60). Tar uploads
+use ia_upload's size-based response timeout.
+.SH REQUIREMENTS
+IA write credentials configured with ia configure, and published size and MD5
+for every source file. Avoid editing selected folders while a run is active.
+Metadata can lag accepted uploads or deletions; retain the workspace and
+re-run later if confirmation retries run out.
+.SH EXIT STATUS
+0 complete; 1 transfer, verification or local I/O failure; 2 invalid usage or
+unsafe/changed source paths; 130 interrupted.
+.SH EXAMPLES
+.nf
+ia_repack.py my-item 'folder one' 'parent/folder two' --dry-run
+ia_repack.py my-item 'folder one' 'parent/folder two' \\
+    --delete-originals --yes --clean-local --log repack.log
+.fi
+.SH SEE ALSO
+.BR ia_download (1), ia_upload (1)
+.SH COPYRIGHT
+Copyright (C) 2026 Whyte. GPL-3.0-or-later. See LICENSE.
